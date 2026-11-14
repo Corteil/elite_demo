@@ -202,61 +202,6 @@ _STREAKS = tuple(
     for i in range(18))
 
 
-def _hexagon(ctx, corners, k):
-    ctx.begin_path()
-    x, y = corners[5]
-    ctx.move_to(int(x * k), int(y * k))
-    for x, y in corners:
-        ctx.line_to(int(x * k), int(y * k))
-
-
-def _draw_dock(ctx, f, t, rgb):
-    """Docking: see draw_tunnel. Ring 0 is the mouth, in the station's
-    colour; the last ring is the bay doors, filled dimly."""
-    ctx.line_width = 1.5
-    s = _dock_depth(f)
-    a = t * TUNNEL_SPIN
-    ca = math.cos(a)
-    sa = math.sin(a)
-    corners = [(TUNNEL_FOCAL * (x * ca - y * sa), TUNNEL_FOCAL * (x * sa + y * ca))
-               for x, y in _HEX]
-    last = TUNNEL_RINGS - 1
-    near = far = None
-    # far to near, so the doors are filled before the rings are drawn over them
-    for i in range(last, -1, -1):
-        z = i + DOCK_START - s
-        if z < 0.4:
-            continue
-        k = 1.0 / z
-        if far is None:
-            far = k
-        near = k
-        b = 1.0 if z < 2 else 2.0 / z      # dimmer further in
-        if i == last:                       # the doors
-            ctx.rgb(rgb[0] * 0.25, rgb[1] * 0.25, rgb[2] * 0.25)
-            _hexagon(ctx, corners, k)
-            ctx.fill()
-            ctx.rgb(rgb[0] * b, rgb[1] * b, rgb[2] * b)
-        elif i == 0:                        # the mouth
-            ctx.rgb(rgb[0] * b, rgb[1] * b, rgb[2] * b)
-        else:
-            ctx.rgb(b, b, b)
-        _hexagon(ctx, corners, k)
-        ctx.stroke()
-    if near is not None and far != near:    # the tunnel's six long edges
-        ctx.rgb(*GREY)
-        ctx.begin_path()
-        for x, y in corners:
-            ctx.move_to(int(x * near), int(y * near))
-            ctx.line_to(int(x * far), int(y * far))
-        ctx.stroke()
-
-
-# the launch tunnel: hexagonal rings one unit apart, the way out of the station
-TUNNEL_RINGS = 12
-TUNNEL_FOCAL = 62.0     # pixels across a ring of radius 1 at distance 1
-TUNNEL_SPIN = 0.5       # radians per second: the station turns as you leave
-_HEX = tuple((math.cos(k * TAU / 6), math.sin(k * TAU / 6)) for k in range(6))
 # A station's colour says what kind of government runs the system, warm for
 # the dangerous ones and cool for the safe ones, in the order of
 # galaxy.GOVERNMENTS. It is used for the tunnel's mouth and the badge's LEDs as
@@ -282,22 +227,215 @@ def station_colour(government):
     return STATION_COLOURS[government & 7]
 
 
-def tunnel_glow(f):
+# ---- the station's tunnel, for launching and docking --------------------
+#
+# Each station has its own tunnel (Tunnel): the rings change shape from the
+# mouth, which is the station's slot (a flat letterbox, level), through the
+# station's own shape halfway in, to a hexagon at the bay doors; and the gaps
+# between them follow a pattern. Every shape is the same 12 points in the
+# same order round the centre, so a ring between two shapes is a blend.
+TUNNEL_RINGS = 12
+TUNNEL_FOCAL = 62.0     # pixels across a ring of radius 1 at distance 1
+TUNNEL_SPIN = 0.5       # radians per second: the station turns as you go through
+_CORNERS = 12
+
+
+def _ngon(n):
+    """A regular n-sided shape (n divides 12, a corner at 0 degrees), as 12
+    points at 30 degree steps."""
+    side = TAU / n
+    out = []
+    for k in range(_CORNERS):
+        a = k * TAU / _CORNERS
+        r = math.cos(side / 2) / math.cos(a % side - side / 2)
+        out.append((r * math.cos(a), r * math.sin(a)))
+    return tuple(out)
+
+
+def _slot(aspect):
+    """A station's slot: a rectangle aspect times as wide as it is tall, as 12
+    points, three to each quarter (the middle of the side, half way up it,
+    the corner), in the same order as _ngon's."""
+    w = 1.0
+    h = 1.0 / aspect
+    out = []
+    for sx, sy, flip in ((1, 1, False), (-1, 1, True), (-1, -1, False), (1, -1, True)):
+        q = ((w, 0.0), (w, h * 0.5), (w, h)) if not flip else ((0.0, h), (w, h), (w, h * 0.5))
+        out.extend((x * sx, y * sy) for x, y in q)
+    return tuple(out)
+
+
+HEXAGON = _ngon(6)
+# the shape halfway along, which is what makes one station's tunnel unlike
+# another's (the hexagon means straight from the slot to the doors)
+TUNNEL_SHAPES = (
+    ("HEXAGON", HEXAGON),
+    ("SQUARE", _ngon(4)),
+    ("TRIANGLE", _ngon(3)),
+    ("ROUND", _ngon(12)),
+)
+SLOT_ASPECT = {"CORIOLIS": 3.0, "DODO": 2.0}    # from their slots' vertices: 20 x 60 and 32 x 64
+
+# the gaps between rings, from the mouth inwards, before they are scaled to
+# add up to TUNNEL_RINGS - 1 (so a tunnel is always the same length)
+TUNNEL_SPACINGS = (
+    ("EVEN", (1,) * 11),
+    ("WIDENING", tuple(0.4 + 0.12 * i for i in range(11))),
+    ("NARROWING", tuple(1.6 - 0.12 * i for i in range(11))),
+    ("PAIRS", tuple(0.45 if i % 2 else 1.55 for i in range(11))),
+    ("THREES", tuple(2.0 if i % 3 == 2 else 0.5 for i in range(11))),
+)
+
+
+def _blend(pa, pb, t):
+    t = t * t * (3 - 2 * t)     # eased: the change is quickest in the middle
+    return [(xa + (xb - xa) * t, ya + (yb - ya) * t) for (xa, ya), (xb, yb) in zip(pa, pb)]
+
+
+class Tunnel:
+    """One station's tunnel. Ring 0 is the mouth, the last ring the bay
+    doors. depth[j] is ring j's distance in from the mouth (0 to
+    TUNNEL_RINGS - 1); pts[j] its corners as whole numbers, 16ths of a pixel
+    at distance 1. seed (the system's number) picks the middle shape and the
+    spacing; station (its ship name) the slot's shape."""
+
+    def __init__(self, seed=0, station="CORIOLIS"):
+        seed = int(seed) & 0xFF
+        mid = seed % len(TUNNEL_SHAPES)
+        sp = (seed // 4 + seed // 17) % len(TUNNEL_SPACINGS)
+        self.names = ("SLOT", TUNNEL_SHAPES[mid][0], "HEXAGON", TUNNEL_SPACINGS[sp][0])
+        slot = _slot(SLOT_ASPECT.get(station, 3.0))
+        middle = TUNNEL_SHAPES[mid][1]
+        gaps = TUNNEL_SPACINGS[sp][1]
+        k = (TUNNEL_RINGS - 1) / sum(gaps)
+        last = TUNNEL_RINGS - 1
+        self.depth = []
+        self.pts = []
+        d = 0.0
+        scale = TUNNEL_FOCAL * 16
+        for j in range(TUNNEL_RINGS):
+            if j:
+                d += gaps[j - 1] * k
+            self.depth.append(d if j < last else float(last))
+            t = 2.0 * j / last
+            ring = _blend(slot, middle, t) if t <= 1.0 else _blend(middle, HEXAGON, t - 1.0)
+            self.pts.append([(int(x * scale), int(y * scale)) for x, y in ring])
+        self.mouth_in = 1.0 / SLOT_ASPECT.get(station, 3.0)   # the slot's half height, for the stars beyond
+
+
+_TUNNEL0 = None
+
+
+def _tunnel(tun):
+    global _TUNNEL0
+    if tun is not None:
+        return tun
+    if _TUNNEL0 is None:
+        _TUNNEL0 = Tunnel(0)
+    return _TUNNEL0
+
+
+# where each corner of each ring lands on the screen, while drawing
+_SX = [0] * (TUNNEL_RINGS * _CORNERS)
+_SY = [0] * (TUNNEL_RINGS * _CORNERS)
+
+
+def _draw_rings(ctx, tun, zs, t, rgb, doors):
+    """Draw the rings at distances zs[j] (None if not drawn), the mouth and
+    (if doors) the filled bay doors in the station's colour, and the long
+    edges joining every other corner."""
+    ctx.line_width = 1.5
+    a = t * TUNNEL_SPIN
+    ca = int(math.cos(a) * 1024)
+    sa = int(math.sin(a) * 1024)
+    sx = _SX
+    sy = _SY
+    last = TUNNEL_RINGS - 1
+    shown = []
+    for j in range(TUNNEL_RINGS):
+        z = zs[j]
+        if z is None:
+            continue
+        shown.append(j)
+        kk = int(1024 / z)
+        base = j * _CORNERS
+        for i, (x, y) in enumerate(tun.pts[j]):
+            sx[base + i] = ((x * ca - y * sa) >> 10) * kk >> 14
+            sy[base + i] = ((x * sa + y * ca) >> 10) * kk >> 14
+    # far to near, so the doors are filled before anything is drawn over them
+    shown.sort(key=lambda j: -zs[j])
+    for j in shown:
+        z = zs[j]
+        b = 1.0 if z < 2 else 2.0 / z      # dimmer further in
+        base = j * _CORNERS
+        if j == last and doors:
+            ctx.rgb(rgb[0] * 0.25, rgb[1] * 0.25, rgb[2] * 0.25)
+            _ring_path(ctx, base)
+            ctx.fill()
+        if j == 0 or (j == last and doors):
+            ctx.rgb(rgb[0] * b, rgb[1] * b, rgb[2] * b)
+        else:
+            ctx.rgb(b, b, b)
+        _ring_path(ctx, base)
+        ctx.stroke()
+    if len(shown) > 1:
+        ctx.rgb(*GREY)
+        ctx.begin_path()
+        for i in range(0, _CORNERS, 2):
+            first = True
+            for j in shown:
+                p = j * _CORNERS + i
+                if first:
+                    ctx.move_to(sx[p], sy[p])
+                    first = False
+                else:
+                    ctx.line_to(sx[p], sy[p])
+        ctx.stroke()
+
+
+def _ring_path(ctx, base):
+    sx = _SX
+    sy = _SY
+    ctx.begin_path()
+    p = base + _CORNERS - 1
+    ctx.move_to(sx[p], sy[p])
+    for p in range(base, base + _CORNERS):
+        ctx.line_to(sx[p], sy[p])
+
+
+def _pulse(s, passes, mouth_flash):
+    """How bright the LEDs are when s has gone past the first few of passes
+    (the s at which each ring goes by, in order): a fading pulse after each
+    ring, and after the mouth (the ring passes[mouth_flash], if any) a full
+    flash fading to 0.4."""
+    last = None
+    for n, p in enumerate(passes):
+        if s >= p:
+            last = n
+    if last is None:
+        return 0.0
+    p = s - passes[last]
+    if last == mouth_flash:
+        return 1.0 - 0.6 * min(1.0, p)
+    return 0.5 * (1 - p) * (1 - p) if p < 1 else 0.0
+
+
+def tunnel_glow(f, tun=None):
     """How bright the LEDs are at point f (0 to 1) of the launch: a pulse as
     each ring goes by, then full once you are out of the mouth."""
-    p = (TUNNEL_RINGS + 1) * f * f - 0.2    # ring i goes past when this reaches i
-    if p < 0:
-        return 0.0
-    n = int(p)
-    if n >= TUNNEL_RINGS - 1:
+    tun = _tunnel(tun)
+    last = TUNNEL_RINGS - 1
+    s = (TUNNEL_RINGS + 1) * f * f
+    if s >= last + 0.2:                 # out of the mouth
         return 1.0
-    p -= n
-    return 0.5 * (1 - p) * (1 - p)
+    # ring j goes by when last - depth[j] + 0.6 - s = 0.4; the doors behind you don't
+    passes = [last - tun.depth[j] + 0.2 for j in range(last - 1, -1, -1)]
+    return _pulse(s, passes, None)
 
 
 # Docking is the launch the other way round: in through the mouth, the rings
 # coming at you more and more slowly, to a stop at the bay doors at the back.
-DOCK_START = 3.0        # the mouth starts this far ahead (rings are one unit apart)
+DOCK_START = 3.0        # the mouth starts this far ahead
 DOCK_END = 2.2          # and you stop with the doors this far ahead
 
 
@@ -308,19 +446,15 @@ def _dock_depth(f):
     return (DOCK_START + TUNNEL_RINGS - 1 - DOCK_END) * (1.0 - g * g)
 
 
-def dock_glow(f):
+def dock_glow(f, tun=None):
     """How bright the LEDs are at point f (0 to 1) of docking: rising as the
     mouth comes up, a flash going through it, then a pulse for each ring."""
-    p = _dock_depth(f) - (DOCK_START - 0.4)     # ring i goes past when this reaches i
-    if p < 0:
-        return 0.4 * (1.0 + p / (DOCK_START - 0.4))
-    n = int(p)
-    if n >= TUNNEL_RINGS - 1:
-        return 0.0
-    p -= n
-    if n == 0:
-        return 1.0 - 0.6 * p
-    return 0.5 * (1 - p) * (1 - p)
+    tun = _tunnel(tun)
+    s = _dock_depth(f)
+    first = DOCK_START - 0.4            # the mouth goes by when s reaches this
+    if s < first:
+        return 0.4 * s / first
+    return _pulse(s, [d + first for d in tun.depth], 0)
 
 
 # stars seen through the mouth of the tunnel: (x, y, distance from the centre)
@@ -337,59 +471,39 @@ def _scatter(n):
 
 
 _STARS = _scatter(40)
+_ZS = [None] * TUNNEL_RINGS
 
 
-def draw_tunnel(ctx, f, t, rgb=GREEN, inward=False):
-    """The launch: flying out along a tunnel of hexagons. f goes from 0 at the
-    start to 1 at the mouth; t is the time in seconds, for the spin; rgb is
-    the station's colour, for the mouth. With inward, docking instead: f
-    goes from 0 outside the mouth to 1 stopped at the doors."""
+def draw_tunnel(ctx, f, t, rgb=GREEN, inward=False, tun=None):
+    """The launch: flying out along the station's tunnel (tun, a Tunnel). f
+    goes from 0 at the start to 1 at the mouth; t is the time in seconds,
+    for the spin; rgb is the station's colour, for the mouth. With inward,
+    docking instead: f goes from 0 outside the mouth to 1 stopped at the
+    doors."""
+    tun = _tunnel(tun)
     ctx.rgb(0, 0, 0).rectangle(-120, -120, 240, 240).fill()
+    zs = _ZS
+    last = TUNNEL_RINGS - 1
     if inward:
-        _draw_dock(ctx, f, t, rgb)
+        s = _dock_depth(f)
+        for j in range(TUNNEL_RINGS):
+            z = tun.depth[j] + DOCK_START - s
+            zs[j] = z if z >= 0.4 else None
+        _draw_rings(ctx, tun, zs, t, rgb, True)
         return
-    ctx.line_width = 1.5
     s = (TUNNEL_RINGS + 1) * f * f      # slow at first, then faster
-    a = t * TUNNEL_SPIN
-    ca = math.cos(a)
-    sa = math.sin(a)
-    corners = [(TUNNEL_FOCAL * (x * ca - y * sa), TUNNEL_FOCAL * (x * sa + y * ca))
-               for x, y in _HEX]
-    # space, through the mouth: as far out as the circle inside the last hexagon
-    z = TUNNEL_RINGS - 1 + 0.6 - s
-    seen = 170 if z < 0.4 else int(0.87 * TUNNEL_FOCAL / z)
+    # space, through the mouth: as far out as the circle inside it
+    z = 0.6 - s + last
+    seen = 170 if z < 0.4 else int(tun.mouth_in * TUNNEL_FOCAL / z)
     if seen > 4:
         ctx.rgb(*GREY)
         for x, y, r in _STARS:
             if r < seen:
                 ctx.rectangle(x, y, 1.5, 1.5).fill()
-    near = far = None
-    for i in range(TUNNEL_RINGS):
-        z = i + 0.6 - s
-        if z < 0.4:
-            continue
-        k = 1.0 / z
-        if near is None:
-            near = k
-        far = k
-        b = 1.0 if z < 2 else 2.0 / z      # dimmer further in
-        if i == TUNNEL_RINGS - 1:           # the mouth, with space beyond
-            ctx.rgb(rgb[0] * b, rgb[1] * b, rgb[2] * b)
-        else:
-            ctx.rgb(b, b, b)
-        ctx.begin_path()
-        x, y = corners[5]
-        ctx.move_to(int(x * k), int(y * k))
-        for x, y in corners:
-            ctx.line_to(int(x * k), int(y * k))
-        ctx.stroke()
-    if near is not None and far != near:    # the tunnel's six long edges
-        ctx.rgb(*GREY)
-        ctx.begin_path()
-        for x, y in corners:
-            ctx.move_to(int(x * near), int(y * near))
-            ctx.line_to(int(x * far), int(y * far))
-        ctx.stroke()
+    for j in range(TUNNEL_RINGS):
+        z = last - tun.depth[j] + 0.6 - s
+        zs[j] = z if z >= 0.4 and j < last else None    # the doors are behind you
+    _draw_rings(ctx, tun, zs, t, rgb, False)
 
 
 def draw(ctx, g, ms=None, ring=True):

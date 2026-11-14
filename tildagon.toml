@@ -8,4 +8,4 @@ class = "AceCommander"
 [metadata]
 author = "Corteil"
 description = "Wireframe space combat inspired by BBC Micro Elite: fly by tilt, joystick or keyboard, plus a ship viewer."
-version = "28"
+version = "29"

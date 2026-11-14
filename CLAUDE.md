@@ -262,6 +262,20 @@ of a real flight, not from a harness.
    `DOCK_END` ahead. The LEDs (`cockpit.dock_glow`) rise as the mouth nears, flash going
    through it, pulse for each ring; then `_dock()` as before. DOCK NOW and GAME OVER + C
    skip the scene. Measured on the badge (real ctx, REPL): 14-19 ms a frame to draw.
+   **Build 29: every station's tunnel is different** (Brian's requests). `cockpit.Tunnel(system,
+   station)`: the mouth is the station's slot, a level letterbox (`SLOT_ASPECT`: Coriolis
+   3:1, Dodo 2:1, from their slot vertices); halfway in it is the station's own shape
+   (`TUNNEL_SHAPES`, picked from the system's number: hexagon (straight through), square,
+   triangle or round); the bay doors are always a hexagon. Every shape is 12 (x, y) points
+   in the same order round the centre, so a ring between two is an eased blend. The gaps
+   follow one of `TUNNEL_SPACINGS` (even, widening, narrowing, pairs, threes, scaled so the
+   tunnel is always `TUNNEL_RINGS - 1` long). Launch and docking at one station use the same
+   tunnel (`app._pick_tunnel`). The LED pulses follow the real ring spacing (`_pulse`).
+   Star and cross middle shapes were tried and removed at Brian's request.
+   `tools/tunnel_sheet.py` draws six stations side by side into `tests/shots/tunnels.png`.
+   Measured on the badge (REPL, real ctx):
+   making a tunnel 10 ms; drawing 17-26 ms docking, 10-29 ms launching (the old hexagon
+   launch was 3-55 ms).
 6. **Tilt steering needs tuning: Brian doesn't like how it feels** (2026-11-13). He has not
    said what is wrong yet, so ask before changing it: sensitivity (`TILT_FULL`), dead zone
    (`TILT_DEADZONE`), axis directions, or the D hold time (`HOLD_MISSILE`).
@@ -270,7 +284,7 @@ of a real flight, not from a harness.
 9. The in-flight menu has a DEBUG page of cheats (`DEBUG_MENU` in `app.py`, on by default
    while the game is being built; `Game.god` is the invincibility flag). Add a cheat there for
    each new thing that is slow to reach by playing, and turn it off before publishing.
-   Its title shows the build (build 28), read from `metadata.json` by `app.build()`, so
+   Its title shows the build (build 29), read from `metadata.json` by `app.build()`, so
    bump `version` in `metadata.json` and `tildagon.toml` for every build.
 7. Level names (EASY / NORMAL / HARD) and their numbers are placeholders; see
    `commander.py` (`RANK_DIVISOR`) and `game.py` (`LEVELS`).
@@ -292,7 +306,8 @@ by itself is faster than one fill for all of them (3.5 against 7.7 ms). Flight a
 - Docking by hand (build 27): whether A is possible with the digital joystick (the
   tolerances above), whether B's beam feels right, crash damage and bounce; not yet on
   the badge (deployed and checked over the REPL; Brian's first test run was fine).
-- The docking scene (build 28): its look, its length (`DOCK_TIME`) and the LEDs.
+- The docking scene (build 28, confirmed by Brian) with build 29's varied tunnels: whether
+  the shapes, morphing and spacings look good on the badge.
 - Whether `deploy.bat`'s copy step reports failures properly (the log step is known to work).
 
 Confirmed by Brian on 2026-11-13: F is faster and E slower; the LEDs flash on a hit and the

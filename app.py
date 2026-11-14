@@ -274,6 +274,7 @@ class AceCommander(app.App):
         self.target = None      # the system picked for the next hyperspace jump
         self.launch_t = 0.0     # how far into the launch tunnel
         self.dock_t = 0.0       # how far into the docking tunnel
+        self.tunnel = None      # this station's tunnel (cockpit.Tunnel), for launching and docking
         self.d_t = None         # how long D has been down, when steering by tilt
         self.viewer = None
         self.paused = False
@@ -498,7 +499,8 @@ class AceCommander(app.App):
             self._update_docked(dt, cancel, confirm)
         elif self.mode == "launch":
             self.launch_t += dt
-            self._leds_station(cockpit.tunnel_glow(min(1.0, self.launch_t / LAUNCH_TIME)))
+            self._leds_station(cockpit.tunnel_glow(min(1.0, self.launch_t / LAUNCH_TIME),
+                                                   self.tunnel))
             if confirm or self.launch_t >= LAUNCH_TIME:
                 self.glow = 1.0
                 if self.game is not None:
@@ -507,7 +509,7 @@ class AceCommander(app.App):
                 self._start_flight(True)
         elif self.mode == "docking":
             self.dock_t += dt
-            self._leds_station(cockpit.dock_glow(min(1.0, self.dock_t / DOCK_TIME)))
+            self._leds_station(cockpit.dock_glow(min(1.0, self.dock_t / DOCK_TIME), self.tunnel))
             if confirm or self.dock_t >= DOCK_TIME:
                 self._leds_release()
                 self._dock()
@@ -673,7 +675,19 @@ class AceCommander(app.App):
         elif confirm and d.name() == "STATUS":
             self._launch()
 
+    def _pick_tunnel(self):
+        """Each station's tunnel has its own shapes and spacing, from its system."""
+        c = self.cmdr
+        seed = 0
+        station = "CORIOLIS"
+        if c is not None and c.system is not None:
+            seed = c.system
+            if self.galaxy is not None and self.galaxy.system(seed).tech >= game.DODO_TECH:
+                station = "DODO"
+        self.tunnel = cockpit.Tunnel(seed, station)
+
     def _launch(self):
+        self._pick_tunnel()
         self.launch_t = 0.0
         self.dock = None
         self.mode = "launch"
@@ -874,6 +888,7 @@ class AceCommander(app.App):
                 g.docked = False
                 self._bank()
                 self.dock_t = 0.0
+                self._pick_tunnel()
                 self.mode = "docking"
         return True
 
@@ -1075,10 +1090,10 @@ class AceCommander(app.App):
             self.dock.draw(ctx)
         elif self.mode == "launch":
             cockpit.draw_tunnel(ctx, min(1.0, self.launch_t / LAUNCH_TIME), self.launch_t,
-                                cockpit.station_colour(self._government()))
+                                cockpit.station_colour(self._government()), False, self.tunnel)
         elif self.mode == "docking":
             cockpit.draw_tunnel(ctx, min(1.0, self.dock_t / DOCK_TIME), self.dock_t,
-                                cockpit.station_colour(self._government()), True)
+                                cockpit.station_colour(self._government()), True, self.tunnel)
         else:
             self._draw_menu(ctx)
         ctx.restore()
